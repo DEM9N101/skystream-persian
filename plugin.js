@@ -243,29 +243,50 @@
   function tmdbLookup(title, year, isMovie) {
     var q = latinQuery(title).replace(/\b(19|20)\d{2}\b/g, ' ').replace(/\s+/g, ' ').trim();
     if (!q || q.length < 2) return Promise.resolve(null);
-    var cacheKey = 'tmdb:' + (isMovie ? 'm' : 't') + ':' + q.toLowerCase() + ':' + (year || '');
+    var cacheKey = 'tmdb2:' + (isMovie ? 'm' : 't') + ':' + q.toLowerCase() + ':' + (year || '');
     return prefGet(cacheKey).then(function (cached) {
       if (cached) { try { return JSON.parse(cached); } catch (e) {} }
       var url = 'https://api.themoviedb.org/3/search/' + (isMovie ? 'movie' : 'tv') +
         '?api_key=' + TMDB_KEY + '&query=' + encodeURIComponent(q) + '&language=en-US&page=1';
-      if (year) url += (isMovie ? '&year=' : '&first_air_date_year=') + year;
+      // For TV, never filter by the post's year: Persian posts are per-season,
+      // so the year is a season air-year, not the show's first_air_date — and
+      // spinoffs from that year hijack the match.
+      if (year && isMovie) url += '&year=' + year;
       return httpGet(url, { Accept: 'application/json' }, 6000, 0).then(function (res) {
-        function pick(body) {
+        function bestOf(body) {
           if (res.status !== 200 || !body) return null;
           var json;
           try { json = JSON.parse(body); } catch (e) { return null; }
-          return (json.results || [])[0] || null;
+          var list = json.results || [];
+          if (!list.length) return null;
+          // pick the result whose name best overlaps the query tokens (avoids
+          // spinoffs/documentaries fuzzy-matching their parent show)
+          var qTokens = {};
+          q.toLowerCase().split(' ').forEach(function (w) { if (w.length > 1) qTokens[w] = 1; });
+          var qn = Object.keys(qTokens).length || 1;
+          var best = null, bestScore = -1;
+          list.forEach(function (r) {
+            var nm = String((isMovie ? r.title || r.original_title : r.name || r.original_name) || '').toLowerCase();
+            var hit = 0;
+            Object.keys(qTokens).forEach(function (w) { if (nm.indexOf(w) !== -1) hit += 1; });
+            var nmTokens = nm.split(/\s+/).filter(Boolean).length;
+            var score = hit / qn
+              + (nm === q ? 2 : 0)                 // exact name wins ties
+              - Math.max(0, nmTokens - hit) * 0.15; // penalize spinoff suffixes
+            if (score > bestScore) { bestScore = score; best = r; }
+          });
+          return best;
         }
-        var r = pick(res.body);
+        var r = bestOf(res.body);
         if (!r && year) {
           // post year (e.g. a later season) can exclude the real title — retry unfiltered
           var url2 = 'https://api.themoviedb.org/3/search/' + (isMovie ? 'movie' : 'tv') +
             '?api_key=' + TMDB_KEY + '&query=' + encodeURIComponent(q) + '&language=en-US&page=1';
           return httpGet(url2, { Accept: 'application/json' }, 6000, 0).then(function (res2) {
-            if (res2.status !== 200 || !res2.body) return null;
-            var json2;
-            try { json2 = JSON.parse(res2.body); } catch (e) { return null; }
-            return (json2.results || [])[0] || null;
+            var savedRes = res;
+            var body = res2.body, status = res2.status;
+            res = { status: status };
+            return bestOf(body);
           }).then(applyResult).catch(function () { return null; });
         }
         return applyResult(r);
@@ -274,6 +295,7 @@
       function applyResult(r) {
         if (!r) return null;
         var data = {
+          id: r.id || null,
           name: isMovie ? (r.title || r.original_title) : (r.name || r.original_name),
           year: parseInt(((isMovie ? r.release_date : r.first_air_date) || '').substring(0, 4), 10) || null,
           poster: r.poster_path ? TMDB_IMG + '/w500' + r.poster_path : null,
@@ -698,7 +720,24 @@
         }
         return score(b) - score(a);
       });
-      return out.slice(0, 6); // keep the picker clean: best 6 options
+      var candidates = out.slice(0, 6); // keep the picker clean: best 6 options
+      // Pre-verify each candidate with a tiny Range request so dead/geo links
+      // never reach the player ("video cannot reach" prevention).
+      return Promise.all(candidates.map(function (s) {
+        return withTimeout(httpGet(s.url, {
+          Range: 'bytes=0-1023',
+          Referer: (s.headers && s.headers.Referer) || 'https://www.doostihaa.com/'
+        }, 6000, 0), 8000, { status: 0, body: '', headers: {} }).then(function (res) {
+          var ct = String(res.headers && res.headers['content-type'] || '');
+          var cr = String(res.headers && res.headers['content-range'] || '');
+          var ok = (res.status === 200 || res.status === 206) &&
+            (/video|mpegurl|matroska|octet/i.test(ct) || (res.status === 206 && cr.indexOf('/') !== -1));
+          return { s: s, ok: ok };
+        }).catch(function () { return { s: s, ok: false }; });
+      })).then(function (checks) {
+        var good = checks.filter(function (c) { return c.ok; }).map(function (c) { return c.s; });
+        return good.length ? good : candidates; // if nothing verifies (e.g. network hiccup), show all
+      });
     });
   }
 
@@ -856,7 +895,6 @@
       details = details.filter(Boolean);
       if (!details.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'load failed on all sources' });
 
-      // merged metadata via TMDB
       var bestTitle = details[0].rawTitle;
       var year = null;
       details.forEach(function (d) { if (d.year) year = d.year; });
@@ -878,53 +916,115 @@
       });
 
       withTimeout(tmdbLookup(bestTitle, year, !anySeries), 7000, null).then(function (meta) {
-        var it = buildItemFromTmdb(meta, null, bestTitle, posterGuess, year);
-        var item = new MultimediaItem({
-          title: it.title,
-          url: url,
-          posterUrl: it.poster,
-          bannerUrl: it.banner,
-          description: it.overview || stripTags(details[0].rawTitle),
-          year: it.year,
-          score: it.rating,
-          type: (anySeries || Object.keys(epMap).length > 0) ? 'series' : 'movie'
-        });
+        // Series split across per-season posts: find sibling posts of the same
+        // show (same TMDB id) and merge their episodes in.
+        var seriesMeta = (!anySeries && Object.keys(epMap).length === 0 && movieLinks.length && meta && meta.id && !/film|movie/i.test(bestTitle)) ? null : (anySeries ? meta : meta);
+        var needSeasonMerge = anySeries && meta && meta.id && meta.name && map.d;
 
-        var episodes = [];
-        if (Object.keys(epMap).length) {
-          var keys = Object.keys(epMap).map(function (k) {
-            var parts = k.split(':');
-            return { s: parseInt(parts[0], 10), e: parseInt(parts[1], 10) };
-          }).sort(function (a, b) { return a.s - b.s || a.e - b.e; });
+        var mergeJob = needSeasonMerge
+          ? mergeSiblingSeasons(meta, map.d, epMap)
+          : Promise.resolve(epMap);
 
-          keys.forEach(function (k) {
-            var best = epMap[k.s + ':' + k.e].map(function (l) {
+        mergeJob.then(function (mergedMap) {
+          epMap = mergedMap;
+          var it = buildItemFromTmdb(meta, null, bestTitle, posterGuess, year);
+          var item = new MultimediaItem({
+            title: it.title,
+            url: url,
+            posterUrl: it.poster,
+            bannerUrl: it.banner,
+            description: it.overview || stripTags(details[0].rawTitle),
+            year: it.year,
+            score: it.rating,
+            type: (anySeries || Object.keys(epMap).length > 0) ? 'series' : 'movie'
+          });
+
+          var episodes = [];
+          if (Object.keys(epMap).length) {
+            var keys = Object.keys(epMap).map(function (k) {
+              var parts = k.split(':');
+              return { s: parseInt(parts[0], 10), e: parseInt(parts[1], 10) };
+            }).sort(function (a, b) { return a.s - b.s || a.e - b.e; });
+
+            keys.forEach(function (k) {
+              var best = epMap[k.s + ':' + k.e].map(function (l) {
+                return qualityOf(l.label + ' ' + l.url).h;
+              }).reduce(function (a, b) { return Math.max(a, b); }, 0);
+              episodes.push(new Episode({
+                name: 'S' + k.s + ' · Episode ' + k.e + (best ? ' · ' + best + 'p' : ''),
+                url: JSON.stringify(epMap[k.s + ':' + k.e]),
+                season: k.s,
+                episode: k.e
+              }));
+            });
+          } else if (movieLinks.length) {
+            var bestH = movieLinks.map(function (l) {
               return qualityOf(l.label + ' ' + l.url).h;
             }).reduce(function (a, b) { return Math.max(a, b); }, 0);
             episodes.push(new Episode({
-              name: 'Episode ' + k.e + (best ? ' · ' + best + 'p' : ''),
-              url: JSON.stringify(epMap[k.s + ':' + k.e]),
-              season: k.s,
-              episode: k.e
+              name: 'Full Movie' + (bestH ? ' · ' + bestH + 'p' : ''),
+              url: JSON.stringify(movieLinks),
+              season: 1,
+              episode: 1
             }));
-          });
-        } else if (movieLinks.length) {
-          var bestH = movieLinks.map(function (l) {
-            return qualityOf(l.label + ' ' + l.url).h;
-          }).reduce(function (a, b) { return Math.max(a, b); }, 0);
-          episodes.push(new Episode({
-            name: 'Full Movie' + (bestH ? ' · ' + bestH + 'p' : ''),
-            url: JSON.stringify(movieLinks),
-            season: 1,
-            episode: 1
-          }));
-        }
+          }
 
-        if (!episodes.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no playable links found' });
-        item.episodes = episodes;
-        cb({ success: true, data: item });
+          if (!episodes.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no playable links found' });
+          item.episodes = episodes;
+          cb({ success: true, data: item });
+        }).catch(function (e) { cbError(cb, e); });
       }).catch(function (e) { cbError(cb, e); });
     }).catch(function (e) { cbError(cb, e); });
+  }
+
+  /* Find other doostihaa posts of the SAME series (same TMDB id) and merge
+   * their season episodes into epMap. doostihaa publishes one post per season. */
+  function mergeSiblingSeasons(meta, doostihaaUrl, epMap) {
+    var latin = latinQuery(meta.name).replace(/\b(19|20)\d{2}\b/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!latin || latin.length < 2) return Promise.resolve(epMap);
+    var base = 'https://www.doostihaa.com';
+    var searchUrl = base + '/wp-json/wp/v2/posts?search=' + encodeURIComponent(latin) +
+      '&per_page=20&_fields=id,link,title,date';
+    return httpGet(searchUrl, { Accept: 'application/json' }, 15000, 0).then(function (res) {
+      var posts;
+      try { posts = JSON.parse(res.body); } catch (e) { posts = []; }
+      var wanted = latin.toLowerCase();
+      var seasonWords = /^(?:فصل|season|س?$|اول|دوم|سوم|چهارم|پنجم|ششم|هفتم|هشتم|نهم|دهم|یازدهم|دوازدهم|\d+|قسمت|دوبله|فارسی|زیرنویس|دانلود|سریال|فیلم|complete|pack)$/i;
+      var siblings = (Array.isArray(posts) ? posts : []).filter(function (p) {
+        if (!p || !p.link) return false;
+        var u = absUrl(p.link, base);
+        if (u === doostihaaUrl) return false; // base post already merged
+        var t = String(p.title && p.title.rendered ? p.title.rendered : '');
+        var lt = latinQuery(t).toLowerCase();
+        if (lt.indexOf(wanted) !== -1) return true; // title contains series name
+        // Persian-only titles: allow if every latin word is season/noise OR title has season words
+        var rest = lt.replace(wanted, ' ').replace(/\b(19|20)\d{2}\b/g, ' ');
+        var leftovers = rest.split(/\s+/).filter(function (w) { return w && !seasonWords.test(w); });
+        return leftovers.length === 0 && /فصل|season|اول|دوم|سوم|چهارم|پنجم|ششم|هفتم|هشتم|نهم|دهم/.test(t);
+      }).slice(0, 10);
+
+      if (!siblings.length) return epMap;
+      return Promise.all(siblings.map(function (p) {
+        var u = absUrl(p.link, base);
+        var t = stripTags(p.title && p.title.rendered ? p.title.rendered : '');
+        return withTimeout(tmdbLookup(t, yearFrom(t), false), 7000, null).then(function (m2) {
+          if (!m2 || !m2.id || m2.id !== meta.id) return null; // different show (Korea etc.)
+          return withTimeout(SOURCES.doostihaa.loadDetail(u), 25000, null);
+        });
+      })).then(function (sibDetails) {
+        sibDetails.forEach(function (d) {
+          if (!d) return;
+          Object.keys(d.episodes || {}).forEach(function (key) {
+            if (!epMap[key]) epMap[key] = [];
+            d.episodes[key].forEach(function (l) {
+              var dup = epMap[key].some(function (x) { return x.url === l.url; });
+              if (!dup) epMap[key].push(l);
+            });
+          });
+        });
+        return epMap;
+      });
+    }).catch(function () { return epMap; });
   }
 
   function loadStreams(data, cb) {

@@ -1,10 +1,18 @@
 {
   "packageName": "com.dem9n101.persianstream",
   "name": "PersianStream | Persian Movies & Series",
-  "version": 3,
+  "version": 4,
   "baseUrl": "https://www.doostihaa.com",
   "description": "One merged catalog of Persian-dubbed & Persian-subbed movies and series. Sources combined under the hood (Doostihaa + Filmdoon); pick website & quality at play time. No torrents.",
-  "authors": ["DEM9N101"],
-  "languages": ["fa", "en"],
-  "categories": ["Movie", "TvSeries"]
+  "authors": [
+    "DEM9N101"
+  ],
+  "languages": [
+    "fa",
+    "en"
+  ],
+  "categories": [
+    "Movie",
+    "TvSeries"
+  ]
 }
