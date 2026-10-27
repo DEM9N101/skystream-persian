@@ -1,0 +1,9 @@
+{
+  "name": "PersianStream Repository",
+  "packageName": "com.dem9n101.persianstream.repo",
+  "description": "Persian dubbed movies & series for SkyStream — doostihaa, filmdoon, namagate, aparat",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/DEM9N101/skystream-persian/main/dist/plugins.json"
+  ]
+}

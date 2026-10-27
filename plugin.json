@@ -1,0 +1,16 @@
+{
+  "packageName": "com.dem9n101.persianstream",
+  "name": "PersianStream | دوبله فارسی",
+  "version": 1,
+  "baseUrl": "https://www.doostihaa.com",
+  "description": "فیلم و سریال با دوبله فارسی از چند منبع: دوستی‌ها، فیلمدون، نماگیت و آپارات — Persian dubbed movies & series from 4 scraper sources (no torrents).",
+  "authors": ["DEM9N101"],
+  "languages": ["fa"],
+  "categories": ["Movie", "TvSeries"],
+  "providers": [
+    { "id": "doostihaa", "name": "دوستی‌ها | Doostihaa", "baseUrl": "https://www.doostihaa.com" },
+    { "id": "filmdoon",  "name": "فیلمدون | Filmdoon",   "baseUrl": "https://www.filmdoon.com" },
+    { "id": "namagate",  "name": "نماگیت | Namagate",    "baseUrl": "https://namagate.com" },
+    { "id": "aparat",    "name": "آپارات | Aparat",      "baseUrl": "https://www.aparat.com" }
+  ]
+}
