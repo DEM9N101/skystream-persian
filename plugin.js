@@ -933,7 +933,7 @@
           }
           return score(b) - score(a);
         });
-        return good.slice(0, 6).map(function (c) { return c.s; });
+        return good.slice(0, 8).map(function (c) { return c.s; });
       });
     });
   }
