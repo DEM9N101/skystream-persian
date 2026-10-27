@@ -2,12 +2,19 @@
   {
     "packageName": "com.dem9n101.persianstream",
     "name": "PersianStream | دوبله فارسی",
-    "version": 2,
+    "version": 4,
     "baseUrl": "https://www.doostihaa.com",
     "description": "فیلم و سریال دوبله فارسی از ۴ منبع: دوستی‌ها، فیلمدون، نماگیت، آپارات — Persian dubbed movies & series from 4 scraper sources (no torrents)",
-    "authors": ["DEM9N101"],
-    "languages": ["fa"],
-    "categories": ["Movie", "TvSeries"],
+    "authors": [
+      "DEM9N101"
+    ],
+    "languages": [
+      "fa"
+    ],
+    "categories": [
+      "Movie",
+      "TvSeries"
+    ],
     "url": "https://raw.githubusercontent.com/DEM9N101/skystream-persian/main/dist/com.dem9n101.persianstream.sky"
   }
 ]
