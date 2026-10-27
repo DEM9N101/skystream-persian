@@ -68,7 +68,7 @@ global.http_parallel = (requests) => Promise.all(requests.map(r => rawGet(r.url,
 
 global.parseHtml = async (html) => parseHTML(html).document;
 
-global.getPreference = (key) => Promise.resolve(store.has(key) ? store.get(key) : null);
+global.getPreference = (key) => (store.has(key) ? store.get(key) : null); // sync — like the real installer closure
 global.setPreference = (key, val) => { store.set(key, String(val)); };
 
 function SkyClass(defaults) {

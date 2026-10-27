@@ -219,10 +219,20 @@
     aparat: 'aparat'
   };
 
+  /* getPreference may be sync (installer closure) or async (worker global) */
+  function prefGet(key) {
+    try {
+      var v = getPreference(key);
+      return Promise.resolve(v === undefined ? null : v);
+    } catch (e) {
+      return Promise.resolve(null);
+    }
+  }
+
   function resolveBase(site) {
     var cands = SITE_DOMAINS[site] || [manifestBase()];
     var memKey = 'dom:' + site;
-    return getPreference(memKey).then(function (saved) {
+    return prefGet(memKey).then(function (saved) {
       if (saved && saved.indexOf('http') === 0) {
         return probeBase(saved, site).then(function (ok) {
           if (ok) return saved;
@@ -275,7 +285,7 @@
     var q = latinQuery(item.title);
     if (!q || q.length < 2) return Promise.resolve(item);
     var cacheKey = 'tmdb:' + (isMovie ? 'm' : 't') + ':' + q.toLowerCase() + ':' + (item.year || '');
-    return getPreference(cacheKey).then(function (cached) {
+    return prefGet(cacheKey).then(function (cached) {
       var data = null;
       if (cached) { try { data = JSON.parse(cached); } catch (e) {} }
       if (data) return applyMeta(item, data);
