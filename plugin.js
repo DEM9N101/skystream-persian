@@ -861,6 +861,187 @@
   }
 
   /* ================================================================== *
+   *  SOURCE: Movielandz (WP REST with direct media links in content)
+   * ================================================================== */
+
+  function movielandzSource() {
+    var SITE = 'movielandz';
+    var LABEL = 'MovieLandz';
+    var BASE = 'https://movielandz.com';
+
+    function restPosts(qs) {
+      return httpGet(BASE + '/wp-json/wp/v2/posts?' + qs, { Accept: 'application/json' }, 20000, 1)
+        .then(function (res) {
+          var posts;
+          try { posts = JSON.parse(res.body); } catch (e) { posts = []; }
+          return (Array.isArray(posts) ? posts : []).filter(function (p) { return p && p.link; });
+        }).catch(function () { return []; });
+    }
+
+    function toItem(p) {
+      var html = (p.content && p.content.rendered) || '';
+      var im = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+      return {
+        site: SITE,
+        title: p.title && p.title.rendered ? stripTags(p.title.rendered) : '',
+        url: absUrl(p.link, BASE),
+        poster: im ? absUrl(decodeEntities(im[1]), BASE) : null,
+        year: yearFrom(p.title && p.title.rendered ? p.title.rendered : '') || yearFrom(String(p.date || ''))
+      };
+    }
+
+    function search(query) {
+      return restPosts('search=' + encodeURIComponent(query) + '&per_page=15&_fields=id,link,title,content,date')
+        .then(function (posts) { return posts.map(toItem).filter(function (x) { return x.title; }); });
+    }
+
+    function homeLists() {
+      return Promise.all([
+        restPosts('per_page=15&_fields=id,link,title,content,date'),
+        restPosts('search=' + encodeURIComponent('دوبله') + '&per_page=12&_fields=id,link,title,content,date')
+      ]).then(function (r) {
+        return { latest: r[0].map(toItem).filter(function (x) { return x.title; }), dubbed: r[1].map(toItem).filter(function (x) { return x.title; }), latestSeries: [], latestMovies: [] };
+      });
+    }
+
+    function loadDetail(postUrl) {
+      var slug = String(postUrl).split('?')[0].replace(/\/+$/, '').split('/').pop();
+      return parallelGets([
+        BASE + '/wp-json/wp/v2/posts?slug=' + encodeURIComponent(slug) + '&_fields=id,link,title,content,date',
+        postUrl
+      ], {}, 20000).then(function (results) {
+        var posts = [];
+        try { posts = JSON.parse(results[0].body); } catch (e) {}
+        var p = Array.isArray(posts) && posts.length ? posts[0] : null;
+        if (!p) return null;
+        var html = (p.content && p.content.rendered) || '';
+        var rawTitle = p.title && p.title.rendered ? stripTags(p.title.rendered) : '';
+        var ogm = results[1].body.match(/property=["']og:image["'][^>]*content=["']([^"']+)["']/i);
+        var poster = ogm ? absUrl(decodeEntities(ogm[1]), BASE) : null;
+
+        var links = [];
+        var re = /<a[^>]+href=["']([^"']+?\.(?:mp4|mkv)(?:\?[^"']*)?)["'][^>]*>([\s\S]*?)<\/a>/gi;
+        var m;
+        while ((m = re.exec(html)) !== null) {
+          var href = decodeEntities(m[1]);
+          if (/upera/i.test(href)) {
+            links.push({ src: LABEL, label: stripTags(m[2]) || '', url: href, upera: true });
+          } else {
+            links.push({ src: LABEL, label: stripTags(m[2]) || href.split('/').pop(), url: href });
+          }
+        }
+        links = dedupe(links, function (x) { return x.url; });
+
+        var episodes = {}, movie = [];
+        links.forEach(function (l) {
+          var se = seasonEpisodeOf(l.label, l.url);
+          if (se && se.e > 0) {
+            var key = se.s + ':' + se.e;
+            if (!episodes[key]) episodes[key] = [];
+            episodes[key].push(l);
+          } else {
+            movie.push(l);
+          }
+        });
+        return {
+          site: SITE,
+          rawTitle: rawTitle,
+          poster: poster,
+          year: yearFrom(rawTitle) || yearFrom(String(p.date || '')),
+          isSeries: Object.keys(episodes).length > 0 && !movie.length,
+          episodes: episodes,
+          movieLinks: movie
+        };
+      });
+    }
+
+    return { search: search, homeLists: homeLists, loadDetail: loadDetail, label: LABEL };
+  }
+
+  /* ================================================================== *
+   *  SOURCE: MiraMovie (WP REST search, mirror post pages, 1.6GB+ 1080p)
+   * ================================================================== */
+
+  function miramovieSource() {
+    var SITE = 'miramovie';
+    var LABEL = 'MiraMovie';
+    var BASE = 'https://miramovie.top';
+
+    function restSearch(query) {
+      return httpGet(BASE + '/wp-json/wp/v2/posts?search=' + encodeURIComponent(query) +
+        '&per_page=15&_fields=id,link,title,date', { Accept: 'application/json' }, 20000, 1)
+        .then(function (res) {
+          var posts;
+          try { posts = JSON.parse(res.body); } catch (e) { posts = []; }
+          return (Array.isArray(posts) ? posts : []).map(function (p) {
+            if (!p || !p.link) return null;
+            return {
+              site: SITE,
+              title: p.title && p.title.rendered ? stripTags(p.title.rendered) : '',
+              url: absUrl(p.link, BASE),
+              poster: null,
+              year: yearFrom(p.title && p.title.rendered ? p.title.rendered : '') || yearFrom(String(p.date || ''))
+            };
+          }).filter(function (x) { return x && x.title; });
+        }).catch(function () { return []; });
+    }
+
+    function search(query) { return restSearch(query); }
+
+    function homeLists() {
+      return restSearch('').then(function (latest) {
+        return { latest: latest, dubbed: [], latestSeries: [], latestMovies: latest };
+      });
+    }
+
+    function loadDetail(postUrl) {
+      return httpGet(postUrl, {}, 30000, 1).then(function (res) {
+        return parseHtml(res.body).then(function (doc) {
+          if (!doc) return null;
+          var h1 = doc.querySelector('h1');
+          var rawTitle = h1 ? stripTags(h1.textContent) : '';
+          var og = doc.querySelector('meta[property="og:image"]');
+          var poster = og ? absUrl(decodeEntities(og.getAttribute('content') || ''), postUrl) : null;
+
+          var links = [];
+          var re = /<a[^>]+href="([^"]+?\.(?:mp4|mkv)(?:\?[^"']*)?)["'][^>]*>([\s\S]*?)<\/a>/gi;
+          var m;
+          while ((m = re.exec(res.body)) !== null) {
+            var href = decodeEntities(m[1]);
+            var label = stripTags(m[2]) || href.split('/').pop();
+            var upera = /upera/i.test(href);
+            links.push({ src: LABEL, label: label, url: href, upera: upera });
+          }
+          links = dedupe(links, function (x) { return x.url; });
+
+          var episodes = {}, movie = [];
+          links.forEach(function (l) {
+            var se = seasonEpisodeOf(l.label, l.url);
+            if (se && se.e > 0) {
+              var key = se.s + ':' + se.e;
+              if (!episodes[key]) episodes[key] = [];
+              episodes[key].push(l);
+            } else {
+              movie.push(l);
+            }
+          });
+          return {
+            site: SITE,
+            rawTitle: rawTitle,
+            poster: poster,
+            year: yearFrom(rawTitle) || yearFrom(postUrl),
+            isSeries: Object.keys(episodes).length > 0 && !movie.length,
+            episodes: episodes,
+            movieLinks: movie
+          };
+        });
+      });
+    }
+
+    return { search: search, homeLists: homeLists, loadDetail: loadDetail, label: LABEL };
+  }
+
+  /* ================================================================== *
    *  Merge helpers
    * ================================================================== */
 
@@ -882,7 +1063,9 @@
           d: raw.doostihaa || raw.d || null,
           f: raw.filmdoon || raw.f || null,
           m: raw.moviesho || raw.m || null,
-          c: raw.cinamatic || raw.c || null
+          c: raw.cinamatic || raw.c || null,
+          ml: raw.movielandz || raw.ml || null,
+          mr: raw.miramovie || raw.mr || null
         };
       } catch (e) { return {}; }
     }
@@ -891,6 +1074,8 @@
     if (/filmdoon/i.test(u)) return { f: u };
     if (/moviesho/i.test(u)) return { m: u };
     if (/cinamatic/i.test(u)) return { c: u };
+    if (/movielandz/i.test(u)) return { ml: u };
+    if (/miramovie/i.test(u)) return { mr: u };
     return { d: u };
   }
 
@@ -920,7 +1105,9 @@
     doostihaa: doostihaaSource(),
     filmdoon: filmdoonSource(),
     moviesho: movieshoSource(),
-    cinamatic: cinamaticSource()
+    cinamatic: cinamaticSource(),
+    movielandz: movielandzSource(),
+    miramovie: miramovieSource()
   };
 
   function buildStreams(links) {
@@ -1039,12 +1226,14 @@
       SOURCES.doostihaa.homeLists(),
       SOURCES.filmdoon.homeLists(),
       withTimeout(SOURCES.moviesho.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] }),
-      withTimeout(SOURCES.cinamatic.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] })
+      withTimeout(SOURCES.cinamatic.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] }),
+      withTimeout(SOURCES.movielandz.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] }),
+      withTimeout(SOURCES.miramovie.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] })
     ]).then(function (results) {
-      var d = results[0], f = results[1], mh = results[2], ci = results[3];
-      var mergedMovies = dedupe((d.latest || []).concat(f.latestMovies || [], mh.latest || [], ci.latest || []), function (x) { return mergeKey(x.title); });
-      var mergedSeries = dedupe((f.latestSeries || []).concat(mh.latestSeries || [], ci.latestSeries || []), function (x) { return mergeKey(x.title); });
-      var mergedDubbed = dedupe((d.dubbed || []).concat(f.dubbed || [], mh.dubbed || [], ci.dubbed || []), function (x) { return mergeKey(x.title); });
+      var d = results[0], f = results[1], mh = results[2], ci = results[3], ml = results[4], mr = results[5];
+      var mergedMovies = dedupe((d.latest || []).concat(f.latestMovies || [], mh.latest || [], ci.latest || [], ml.latest || [], mr.latest || []), function (x) { return mergeKey(x.title); });
+      var mergedSeries = dedupe((f.latestSeries || []).concat(mh.latestSeries || [], ci.latestSeries || [], mr.latestSeries || []), function (x) { return mergeKey(x.title); });
+      var mergedDubbed = dedupe((d.dubbed || []).concat(f.dubbed || [], mh.dubbed || [], ci.dubbed || [], ml.dubbed || []), function (x) { return mergeKey(x.title); });
 
       var data = {};
       var trending = (mergedMovies.length ? mergedMovies : mergedDubbed).slice(0, 8).map(function (r) {
@@ -1125,9 +1314,11 @@
       withTimeout(SOURCES.doostihaa.search(String(query || '')), 25000, []),
       withTimeout(SOURCES.filmdoon.search(String(query || '')), 25000, []),
       withTimeout(SOURCES.moviesho.search(String(query || '')), 25000, []),
-      withTimeout(SOURCES.cinamatic.search(String(query || '')), 25000, [])
+      withTimeout(SOURCES.cinamatic.search(String(query || '')), 25000, []),
+      withTimeout(SOURCES.movielandz.search(String(query || '')), 25000, []),
+      withTimeout(SOURCES.miramovie.search(String(query || '')), 25000, [])
     ]).then(function (results) {
-      var all = (results[0] || []).concat(results[1] || [], results[2] || [], results[3] || []);
+      var all = (results[0] || []).concat(results[1] || [], results[2] || [], results[3] || [], results[4] || [], results[5] || []);
       // group by normalized title
       var groups = {};
       var order = [];
@@ -1184,6 +1375,8 @@
     if (map.f) jobs.push(SOURCES.filmdoon.loadDetail(map.f));
     if (map.m) jobs.push(SOURCES.moviesho.loadDetail(map.m));
     if (map.c) jobs.push(SOURCES.cinamatic.loadDetail(map.c));
+    if (map.ml) jobs.push(SOURCES.movielandz.loadDetail(map.ml));
+    if (map.mr) jobs.push(SOURCES.miramovie.loadDetail(map.mr));
     if (!jobs.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no sources for this item' });
 
     Promise.all(jobs.map(function (j) { return withTimeout(j, 30000, null); })).then(function (details) {
