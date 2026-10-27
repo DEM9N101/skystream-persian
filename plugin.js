@@ -309,6 +309,26 @@
     }).catch(function () { return null; });
   }
 
+  /* logoUrl via metahub (needs the IMDb id from TMDB external_ids) */
+  function logoLookup(tmdbId, isMovie) {
+    if (!tmdbId) return Promise.resolve(null);
+    var key = 'logo:' + tmdbId;
+    return prefGet(key).then(function (cached) {
+      if (cached) return cached === 'none' ? null : cached;
+      var url = 'https://api.themoviedb.org/3/' + (isMovie ? 'movie' : 'tv') + '/' + tmdbId +
+        '?api_key=' + TMDB_KEY + '&append_to_response=external_ids';
+      return httpGet(url, { Accept: 'application/json' }, 6000, 0).then(function (res) {
+        if (res.status !== 200 || !res.body) return null;
+        var json;
+        try { json = JSON.parse(res.body); } catch (e) { return null; }
+        var imdb = json.external_ids && json.external_ids.imdb_id;
+        var logo = imdb ? ('https://live.metahub.space/logo/medium/' + imdb + '/img') : null;
+        try { setPreference(key, logo || 'none'); } catch (e) {}
+        return logo;
+      }).catch(function () { return null; });
+    });
+  }
+
   /* ================================================================== *
    *  SOURCE: Doostihaa (WordPress REST + watch.php HLS + direct files)
    * ================================================================== */
@@ -605,6 +625,152 @@
   }
 
   /* ================================================================== *
+   *  SOURCE: MoviesHo (WordPress REST + direct musitraf CDN, works abroad)
+   * ================================================================== */
+
+  function movieshoSource() {
+    var SITE = 'moviesho';
+    var LABEL = 'MoviesHo';
+    var BASE = 'https://moviesho.com';
+    var catId = null;
+
+    function restSearch(query) {
+      return httpGet(BASE + '/wp-json/wp/v2/posts?search=' + encodeURIComponent(query) +
+        '&per_page=15&_fields=id,link,title,date', { Accept: 'application/json' }, 18000, 1)
+        .then(function (res) {
+          var posts;
+          try { posts = JSON.parse(res.body); } catch (e) { posts = []; }
+          return (Array.isArray(posts) ? posts : []).map(function (p) {
+            if (!p || !p.link) return null;
+            return {
+              site: SITE,
+              title: p.title && p.title.rendered ? stripTags(p.title.rendered) : '',
+              url: absUrl(p.link, BASE),
+              poster: null,
+              year: yearFrom(p.title && p.title.rendered ? p.title.rendered : '') || yearFrom(String(p.date || ''))
+            };
+          }).filter(function (x) { return x && x.title; });
+        }).catch(function () { return []; });
+    }
+
+    function htmlSearch(query) {
+      return httpGet(BASE + '/?s=' + encodeURIComponent(query), {}, 18000, 0).then(function (res) {
+        if (res.status !== 200) return [];
+        var out = [];
+        var re = /<a[^>]+href="(https:\/\/www\.moviesho\.com\/(?:series\/|anime\/)?[a-z0-9][a-z0-9\-]*(?:-\d{4})?(?:-film|-tv-serial)?\/)"[^>]*>([\s\S]{0,200}?)<\/a>/gi;
+        var m;
+        while ((m = re.exec(res.body)) !== null) {
+          var u = decodeEntities(m[1]);
+          if (/\/(category|tag|page\/|imdb|collection|app|account)/.test(u)) continue;
+          var t = stripTags(m[2]);
+          if (!t || t.length < 3) continue;
+          out.push({ site: SITE, title: t, url: u, poster: null, year: yearFrom(u) || yearFrom(t) });
+        }
+        return dedupe(out, function (x) { return x.url; });
+      }).catch(function () { return []; });
+    }
+
+    function search(query) {
+      return restSearch(query).then(function (items) {
+        if (items.length >= 3) return items;
+        return htmlSearch(query).then(function (more) {
+          return dedupe(items.concat(more), function (x) { return mergeKey(x.title); });
+        });
+      });
+    }
+
+    function dubbedCategoryId() {
+      if (catId) return Promise.resolve(catId);
+      return httpGet(BASE + '/wp-json/wp/v2/categories?slug=farsi-dubbed&_fields=id', { Accept: 'application/json' }, 12000, 0)
+        .then(function (res) {
+          var cats;
+          try { cats = JSON.parse(res.body); } catch (e) { cats = []; }
+          catId = (Array.isArray(cats) && cats.length && cats[0].id) || null;
+          return catId;
+        }).catch(function () { return null; });
+    }
+
+    function restList(qs) {
+      return httpGet(BASE + '/wp-json/wp/v2/posts?' + qs, { Accept: 'application/json' }, 18000, 1)
+        .then(function (res) {
+          var posts;
+          try { posts = JSON.parse(res.body); } catch (e) { posts = []; }
+          return (Array.isArray(posts) ? posts : []).map(function (p) {
+            if (!p || !p.link) return null;
+            return {
+              site: SITE,
+              title: p.title && p.title.rendered ? stripTags(p.title.rendered) : '',
+              url: absUrl(p.link, BASE),
+              poster: null,
+              year: yearFrom(p.title && p.title.rendered ? p.title.rendered : '') || yearFrom(String(p.date || ''))
+            };
+          }).filter(function (x) { return x && x.title; });
+        }).catch(function () { return []; });
+    }
+
+    function homeLists() {
+      return Promise.all([
+        restList('per_page=15&_fields=id,link,title,date'),
+        dubbedCategoryId().then(function (id) {
+          return id ? restList('per_page=12&_fields=id,link,title,date&categories=' + id) : [];
+        })
+      ]).then(function (r) {
+        return { latest: r[0], dubbed: r[1], latestSeries: [], latestMovies: r[0] };
+      });
+    }
+
+    /* detail from post page HTML: download-link anchors + og:image + h1 */
+    function loadDetail(postUrl) {
+      return httpGet(postUrl, {}, 25000, 1).then(function (res) {
+        return parseHtml(res.body).then(function (doc) {
+          if (!doc) return null;
+          var h1 = doc.querySelector('h1');
+          var rawTitle = h1 ? stripTags(h1.textContent) : '';
+          var og = doc.querySelector('meta[property="og:image"]');
+          var poster = og ? absUrl(decodeEntities(og.getAttribute('content') || ''), postUrl) : null;
+
+          var links = [];
+          var nodes = doc.querySelectorAll('a[href]');
+          for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var href = n.getAttribute('href');
+            var cls = String(n.getAttribute('class') || '');
+            if (!href || !/\.(mp4|mkv)(\?|$)/i.test(href)) continue;
+            if (!/musitraf|moviesho|upera/i.test(href)) continue;
+            var qm = cls.match(/dl-(\d{3,4})/i);
+            var label = 'دانلود ' + (qm ? qm[1] + 'p' : (qualityOf(href).label || ''));
+            links.push({ src: LABEL, label: label, url: absUrl(decodeEntities(href), postUrl) });
+          }
+          links = dedupe(links, function (x) { return x.url; });
+
+          var episodes = {}, movie = [];
+          links.forEach(function (l) {
+            var se = seasonEpisodeOf(l.label, l.url);
+            if (se && se.e > 0) {
+              var key = se.s + ':' + se.e;
+              if (!episodes[key]) episodes[key] = [];
+              episodes[key].push(l);
+            } else {
+              movie.push(l);
+            }
+          });
+          return {
+            site: SITE,
+            rawTitle: rawTitle,
+            poster: poster,
+            year: yearFrom(rawTitle) || yearFrom(postUrl),
+            isSeries: Object.keys(episodes).length > 0 && !movie.length,
+            episodes: episodes,
+            movieLinks: movie
+          };
+        });
+      });
+    }
+
+    return { search: search, homeLists: homeLists, loadDetail: loadDetail, label: LABEL };
+  }
+
+  /* ================================================================== *
    *  Merge helpers
    * ================================================================== */
 
@@ -622,12 +788,17 @@
     if (typeof url === 'string' && url.indexOf('ps:') === 0) {
       try {
         var raw = JSON.parse(url.substring(3));
-        return { d: raw.doostihaa || raw.d || null, f: raw.filmdoon || raw.f || null };
+        return {
+          d: raw.doostihaa || raw.d || null,
+          f: raw.filmdoon || raw.f || null,
+          m: raw.moviesho || raw.m || null
+        };
       } catch (e) { return {}; }
     }
     // legacy plain URL — guess source
     var u = String(url || '');
     if (/filmdoon/i.test(u)) return { f: u };
+    if (/moviesho/i.test(u)) return { m: u };
     return { d: u };
   }
 
@@ -655,7 +826,8 @@
 
   var SOURCES = {
     doostihaa: doostihaaSource(),
-    filmdoon: filmdoonSource()
+    filmdoon: filmdoonSource(),
+    moviesho: movieshoSource()
   };
 
   function buildStreams(links) {
@@ -720,9 +892,11 @@
         }
         return score(b) - score(a);
       });
-      var candidates = out.slice(0, 6); // keep the picker clean: best 6 options
+      var candidates = out.slice(0, 8);
       // Pre-verify each candidate with a tiny Range request so dead/geo links
-      // never reach the player ("video cannot reach" prevention).
+      // never reach the player ("video cannot reach" prevention). The response
+      // also gives us the file size = bitrate proxy, so crisp encodes rank
+      // above thin re-encodes at the same resolution.
       return Promise.all(candidates.map(function (s) {
         return withTimeout(httpGet(s.url, {
           Range: 'bytes=0-1023',
@@ -730,13 +904,36 @@
         }, 6000, 0), 8000, { status: 0, body: '', headers: {} }).then(function (res) {
           var ct = String(res.headers && res.headers['content-type'] || '');
           var cr = String(res.headers && res.headers['content-range'] || '');
+          var cl = String(res.headers && res.headers['content-length'] || '');
+          var total = parseInt((cr.split('/')[1] || cl), 10) || 0;
           var ok = (res.status === 200 || res.status === 206) &&
             (/video|mpegurl|matroska|octet/i.test(ct) || (res.status === 206 && cr.indexOf('/') !== -1));
-          return { s: s, ok: ok };
-        }).catch(function () { return { s: s, ok: false }; });
+          return { s: s, ok: ok, size: total };
+        }).catch(function () { return { s: s, ok: false, size: 0 }; });
       })).then(function (checks) {
-        var good = checks.filter(function (c) { return c.ok; }).map(function (c) { return c.s; });
-        return good.length ? good : candidates; // if nothing verifies (e.g. network hiccup), show all
+        var good = checks.filter(function (c) { return c.ok; });
+        if (!good.length) return candidates; // nothing verified (network hiccup) — show all
+        // annotate size into the visible label + re-rank: bitrate matters
+        good.forEach(function (c) {
+          var gb = c.size / 1e9;
+          if (gb >= 0.15 && !/HLS/.test(c.s.source)) {
+            c.s.source += ' · ' + (gb >= 1 ? gb.toFixed(1) : Math.round(gb * 1000) + 'MB').replace('.0GB', 'GB');
+            if (gb >= 1) c.s.source = c.s.source.replace(/GB$/, 'GB');
+          }
+        });
+        good.sort(function (a, b) {
+          function score(c) {
+            var s = c.s;
+            var h = s.quality === 'Auto' ? 9999 : (qualityOf(s.quality + '').h || 0);
+            var dub = /Dubbed/.test(s.source) ? 2 : (/Subbed/.test(s.source) ? 1 : 1.5);
+            var crisp = /(BluRay|WEB-DL|HLS)/.test(s.source) ? 0.5 : 0;
+            var ir = /\(IR IP\)/.test(s.source) ? -0.6 : 0;
+            var sizeBoost = Math.min(c.size / 1e9, 4) * 0.35; // bitrate proxy, capped
+            return h * 10 + dub * 5 + crisp + ir + sizeBoost;
+          }
+          return score(b) - score(a);
+        });
+        return good.slice(0, 6).map(function (c) { return c.s; });
       });
     });
   }
@@ -748,12 +945,13 @@
   function getHome(cb) {
     Promise.all([
       SOURCES.doostihaa.homeLists(),
-      SOURCES.filmdoon.homeLists()
+      SOURCES.filmdoon.homeLists(),
+      withTimeout(SOURCES.moviesho.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] })
     ]).then(function (results) {
-      var d = results[0], f = results[1];
-      var mergedMovies = dedupe((d.latest || []).concat(f.latestMovies || []), function (x) { return mergeKey(x.title); });
-      var mergedSeries = dedupe(f.latestSeries || [], function (x) { return mergeKey(x.title); });
-      var mergedDubbed = dedupe((d.dubbed || []).concat(f.dubbed || []), function (x) { return mergeKey(x.title); });
+      var d = results[0], f = results[1], mh = results[2];
+      var mergedMovies = dedupe((d.latest || []).concat(f.latestMovies || [], mh.latest || []), function (x) { return mergeKey(x.title); });
+      var mergedSeries = dedupe((f.latestSeries || []).concat(mh.latestSeries || []), function (x) { return mergeKey(x.title); });
+      var mergedDubbed = dedupe((d.dubbed || []).concat(f.dubbed || [], mh.dubbed || []), function (x) { return mergeKey(x.title); });
 
       var data = {};
       var trending = (mergedMovies.length ? mergedMovies : mergedDubbed).slice(0, 8).map(function (r) {
@@ -832,9 +1030,10 @@
   function search(query, cb) {
     Promise.all([
       withTimeout(SOURCES.doostihaa.search(String(query || '')), 25000, []),
-      withTimeout(SOURCES.filmdoon.search(String(query || '')), 25000, [])
+      withTimeout(SOURCES.filmdoon.search(String(query || '')), 25000, []),
+      withTimeout(SOURCES.moviesho.search(String(query || '')), 25000, [])
     ]).then(function (results) {
-      var all = (results[0] || []).concat(results[1] || []);
+      var all = (results[0] || []).concat(results[1] || [], results[2] || []);
       // group by normalized title
       var groups = {};
       var order = [];
@@ -889,6 +1088,7 @@
     var jobs = [];
     if (map.d) jobs.push(SOURCES.doostihaa.loadDetail(map.d));
     if (map.f) jobs.push(SOURCES.filmdoon.loadDetail(map.f));
+    if (map.m) jobs.push(SOURCES.moviesho.loadDetail(map.m));
     if (!jobs.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no sources for this item' });
 
     Promise.all(jobs.map(function (j) { return withTimeout(j, 30000, null); })).then(function (details) {
@@ -928,50 +1128,55 @@
         mergeJob.then(function (mergedMap) {
           epMap = mergedMap;
           var it = buildItemFromTmdb(meta, null, bestTitle, posterGuess, year);
-          var item = new MultimediaItem({
-            title: it.title,
-            url: url,
-            posterUrl: it.poster,
-            bannerUrl: it.banner,
-            description: it.overview || stripTags(details[0].rawTitle),
-            year: it.year,
-            score: it.rating,
-            type: (anySeries || Object.keys(epMap).length > 0) ? 'series' : 'movie'
-          });
+          var isMovie = !anySeries;
+          var logoJob = (meta && meta.id) ? withTimeout(logoLookup(meta.id, isMovie), 7000, null).catch(function () { return null; }) : Promise.resolve(null);
+          logoJob.then(function (logoUrl) {
+            var item = new MultimediaItem({
+              title: it.title,
+              url: url,
+              posterUrl: it.poster,
+              bannerUrl: it.banner,
+              logoUrl: logoUrl || undefined,
+              description: it.overview || stripTags(details[0].rawTitle),
+              year: it.year,
+              score: it.rating,
+              type: (anySeries || Object.keys(epMap).length > 0) ? 'series' : 'movie'
+            });
 
-          var episodes = [];
-          if (Object.keys(epMap).length) {
-            var keys = Object.keys(epMap).map(function (k) {
-              var parts = k.split(':');
-              return { s: parseInt(parts[0], 10), e: parseInt(parts[1], 10) };
-            }).sort(function (a, b) { return a.s - b.s || a.e - b.e; });
+            var episodes = [];
+            if (Object.keys(epMap).length) {
+              var keys = Object.keys(epMap).map(function (k) {
+                var parts = k.split(':');
+                return { s: parseInt(parts[0], 10), e: parseInt(parts[1], 10) };
+              }).sort(function (a, b) { return a.s - b.s || a.e - b.e; });
 
-            keys.forEach(function (k) {
-              var best = epMap[k.s + ':' + k.e].map(function (l) {
+              keys.forEach(function (k) {
+                var best = epMap[k.s + ':' + k.e].map(function (l) {
+                  return qualityOf(l.label + ' ' + l.url).h;
+                }).reduce(function (a, b) { return Math.max(a, b); }, 0);
+                episodes.push(new Episode({
+                  name: 'S' + k.s + ' · Episode ' + k.e + (best ? ' · ' + best + 'p' : ''),
+                  url: JSON.stringify(epMap[k.s + ':' + k.e]),
+                  season: k.s,
+                  episode: k.e
+                }));
+              });
+            } else if (movieLinks.length) {
+              var bestH = movieLinks.map(function (l) {
                 return qualityOf(l.label + ' ' + l.url).h;
               }).reduce(function (a, b) { return Math.max(a, b); }, 0);
               episodes.push(new Episode({
-                name: 'S' + k.s + ' · Episode ' + k.e + (best ? ' · ' + best + 'p' : ''),
-                url: JSON.stringify(epMap[k.s + ':' + k.e]),
-                season: k.s,
-                episode: k.e
+                name: 'Full Movie' + (bestH ? ' · ' + bestH + 'p' : ''),
+                url: JSON.stringify(movieLinks),
+                season: 1,
+                episode: 1
               }));
-            });
-          } else if (movieLinks.length) {
-            var bestH = movieLinks.map(function (l) {
-              return qualityOf(l.label + ' ' + l.url).h;
-            }).reduce(function (a, b) { return Math.max(a, b); }, 0);
-            episodes.push(new Episode({
-              name: 'Full Movie' + (bestH ? ' · ' + bestH + 'p' : ''),
-              url: JSON.stringify(movieLinks),
-              season: 1,
-              episode: 1
-            }));
-          }
+            }
 
-          if (!episodes.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no playable links found' });
-          item.episodes = episodes;
-          cb({ success: true, data: item });
+            if (!episodes.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no playable links found' });
+            item.episodes = episodes;
+            cb({ success: true, data: item });
+          }).catch(function (e) { cbError(cb, e); });
         }).catch(function (e) { cbError(cb, e); });
       }).catch(function (e) { cbError(cb, e); });
     }).catch(function (e) { cbError(cb, e); });
