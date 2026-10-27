@@ -771,6 +771,96 @@
   }
 
   /* ================================================================== *
+   *  SOURCE: Cinamatic.top (WP REST + base64 player URLs -> signed direct
+   *  files on dl*.cinamadownload.top — verified working from abroad)
+   * ================================================================== */
+
+  function cinamaticSource() {
+    var SITE = 'cinamatic';
+    var LABEL = 'Cinamatic';
+    var BASE = 'https://cinamatic.top';
+
+    function restList(qs) {
+      return httpGet(BASE + '/wp-json/wp/v2/posts?' + qs, { Accept: 'application/json' }, 18000, 1)
+        .then(function (res) {
+          var posts;
+          try { posts = JSON.parse(res.body); } catch (e) { posts = []; }
+          return (Array.isArray(posts) ? posts : []).map(function (p) {
+            if (!p || !p.link) return null;
+            return {
+              site: SITE,
+              title: p.title && p.title.rendered ? stripTags(p.title.rendered) : '',
+              url: absUrl(p.link, BASE),
+              poster: null,
+              year: yearFrom(p.title && p.title.rendered ? p.title.rendered : '') || yearFrom(String(p.date || ''))
+            };
+          }).filter(function (x) { return x && x.title; });
+        }).catch(function () { return []; });
+    }
+
+    function search(query) {
+      return restList('search=' + encodeURIComponent(query) + '&per_page=15&_fields=id,link,title,date');
+    }
+
+    function homeLists() {
+      return restList('per_page=15&_fields=id,link,title,date').then(function (latest) {
+        return { latest: latest, dubbed: [], latestSeries: [], latestMovies: latest };
+      });
+    }
+
+    function loadDetail(postUrl) {
+      return httpGet(postUrl, {}, 25000, 1).then(function (res) {
+        return parseHtml(res.body).then(function (doc) {
+          if (!doc) return null;
+          var h1 = doc.querySelector('h1');
+          var rawTitle = h1 ? stripTags(h1.textContent) : '';
+          var og = doc.querySelector('meta[property="og:image"]');
+          var poster = og ? absUrl(decodeEntities(og.getAttribute('content') || ''), postUrl) : null;
+
+          // direct files hide base64-encoded in /player?pid=..&file=<b64> anchors
+          var links = [];
+          var nodes = doc.querySelectorAll('a[href]');
+          for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var href = String(n.getAttribute('href') || '');
+            var fm = href.match(/[?&]file=([A-Za-z0-9+/=]+)/);
+            if (!fm) continue;
+            var direct = null;
+            try { direct = atob(fm[1]); } catch (e) { continue; }
+            if (!direct || !/\.(mp4|mkv|m3u8)(\?|$)/i.test(direct)) continue;
+            var label = 'دانلود ' + (qualityOf(direct).label || '');
+            links.push({ src: LABEL, label: label, url: direct });
+          }
+          links = dedupe(links, function (x) { return x.url; });
+
+          var episodes = {}, movie = [];
+          links.forEach(function (l) {
+            var se = seasonEpisodeOf(l.label, l.url);
+            if (se && se.e > 0) {
+              var key = se.s + ':' + se.e;
+              if (!episodes[key]) episodes[key] = [];
+              episodes[key].push(l);
+            } else {
+              movie.push(l);
+            }
+          });
+          return {
+            site: SITE,
+            rawTitle: rawTitle,
+            poster: poster,
+            year: yearFrom(rawTitle) || yearFrom(postUrl),
+            isSeries: Object.keys(episodes).length > 0 && !movie.length,
+            episodes: episodes,
+            movieLinks: movie
+          };
+        });
+      });
+    }
+
+    return { search: search, homeLists: homeLists, loadDetail: loadDetail, label: LABEL };
+  }
+
+  /* ================================================================== *
    *  Merge helpers
    * ================================================================== */
 
@@ -791,7 +881,8 @@
         return {
           d: raw.doostihaa || raw.d || null,
           f: raw.filmdoon || raw.f || null,
-          m: raw.moviesho || raw.m || null
+          m: raw.moviesho || raw.m || null,
+          c: raw.cinamatic || raw.c || null
         };
       } catch (e) { return {}; }
     }
@@ -799,6 +890,7 @@
     var u = String(url || '');
     if (/filmdoon/i.test(u)) return { f: u };
     if (/moviesho/i.test(u)) return { m: u };
+    if (/cinamatic/i.test(u)) return { c: u };
     return { d: u };
   }
 
@@ -827,7 +919,8 @@
   var SOURCES = {
     doostihaa: doostihaaSource(),
     filmdoon: filmdoonSource(),
-    moviesho: movieshoSource()
+    moviesho: movieshoSource(),
+    cinamatic: cinamaticSource()
   };
 
   function buildStreams(links) {
@@ -917,8 +1010,7 @@
         good.forEach(function (c) {
           var gb = c.size / 1e9;
           if (gb >= 0.15 && !/HLS/.test(c.s.source)) {
-            c.s.source += ' · ' + (gb >= 1 ? gb.toFixed(1) : Math.round(gb * 1000) + 'MB').replace('.0GB', 'GB');
-            if (gb >= 1) c.s.source = c.s.source.replace(/GB$/, 'GB');
+            c.s.source += ' · ' + (gb >= 1 ? gb.toFixed(1) + 'GB' : Math.round(gb * 1000) + 'MB');
           }
         });
         good.sort(function (a, b) {
@@ -946,12 +1038,13 @@
     Promise.all([
       SOURCES.doostihaa.homeLists(),
       SOURCES.filmdoon.homeLists(),
-      withTimeout(SOURCES.moviesho.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] })
+      withTimeout(SOURCES.moviesho.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] }),
+      withTimeout(SOURCES.cinamatic.homeLists(), 25000, { latest: [], dubbed: [], latestSeries: [], latestMovies: [] })
     ]).then(function (results) {
-      var d = results[0], f = results[1], mh = results[2];
-      var mergedMovies = dedupe((d.latest || []).concat(f.latestMovies || [], mh.latest || []), function (x) { return mergeKey(x.title); });
-      var mergedSeries = dedupe((f.latestSeries || []).concat(mh.latestSeries || []), function (x) { return mergeKey(x.title); });
-      var mergedDubbed = dedupe((d.dubbed || []).concat(f.dubbed || [], mh.dubbed || []), function (x) { return mergeKey(x.title); });
+      var d = results[0], f = results[1], mh = results[2], ci = results[3];
+      var mergedMovies = dedupe((d.latest || []).concat(f.latestMovies || [], mh.latest || [], ci.latest || []), function (x) { return mergeKey(x.title); });
+      var mergedSeries = dedupe((f.latestSeries || []).concat(mh.latestSeries || [], ci.latestSeries || []), function (x) { return mergeKey(x.title); });
+      var mergedDubbed = dedupe((d.dubbed || []).concat(f.dubbed || [], mh.dubbed || [], ci.dubbed || []), function (x) { return mergeKey(x.title); });
 
       var data = {};
       var trending = (mergedMovies.length ? mergedMovies : mergedDubbed).slice(0, 8).map(function (r) {
@@ -1031,9 +1124,10 @@
     Promise.all([
       withTimeout(SOURCES.doostihaa.search(String(query || '')), 25000, []),
       withTimeout(SOURCES.filmdoon.search(String(query || '')), 25000, []),
-      withTimeout(SOURCES.moviesho.search(String(query || '')), 25000, [])
+      withTimeout(SOURCES.moviesho.search(String(query || '')), 25000, []),
+      withTimeout(SOURCES.cinamatic.search(String(query || '')), 25000, [])
     ]).then(function (results) {
-      var all = (results[0] || []).concat(results[1] || [], results[2] || []);
+      var all = (results[0] || []).concat(results[1] || [], results[2] || [], results[3] || []);
       // group by normalized title
       var groups = {};
       var order = [];
@@ -1089,6 +1183,7 @@
     if (map.d) jobs.push(SOURCES.doostihaa.loadDetail(map.d));
     if (map.f) jobs.push(SOURCES.filmdoon.loadDetail(map.f));
     if (map.m) jobs.push(SOURCES.moviesho.loadDetail(map.m));
+    if (map.c) jobs.push(SOURCES.cinamatic.loadDetail(map.c));
     if (!jobs.length) return cb({ success: false, errorCode: 'NOT_FOUND', message: 'no sources for this item' });
 
     Promise.all(jobs.map(function (j) { return withTimeout(j, 30000, null); })).then(function (details) {
